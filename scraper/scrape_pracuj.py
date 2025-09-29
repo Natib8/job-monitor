@@ -5,13 +5,17 @@
 Monitor ofert – Pracuj.pl
 Frazy: Główna księgowa, Główny księgowy, Chief Accountant
 
-Zmiany:
-- W wiadomości e-mail oraz w załączniku wysyłamy WYŁĄCZNIE XLSX (bez CSV).
-- „Nazwa firmy” pobieramy z employer name na podstronie ogłoszenia:
-  <h2 data-test="text-employerName">...</h2> (fallback: stara heurystyka z listingu).
-- Tabela w mailu: Nazwa firmy | Nazwa stanowiska | Link | Data dodania ogłoszenia.
-- Sortowanie: najświeższe u góry (po „published” jeśli dostępne, inaczej po „first_seen”).
-- Priorytet wysyłki: SendGrid; fallback: SMTP (Gmail/M365). Obsługa wielu odbiorców (TO_EMAIL po przecinku).
+Kluczowe funkcje:
+- Pierwszy bieg: pełny zaciąg (głębsza paginacja), kolejne: przyrosty + deduplikacja.
+- Wzbogacanie ogłoszeń z podstrony:
+    * employer_name z JSON-LD (hiringOrganization.name) lub [data-test="text-employerName"],
+    * datePosted (data publikacji) z JSON-LD → 'published_iso' (YYYY-MM-DD),
+    * validThrough (opcjonalnie) z JSON-LD lub bloku „do 11 paź” (nie używamy do sortu).
+- E-mail:
+    * treść: jedna tabela HTML (Nazwa firmy | Nazwa stanowiska | Link | Data dodania ogłoszenia),
+    * załącznik: WYŁĄCZNIE XLSX (bez CSV), posortowane najświeższe na górze,
+    * obsługa wielu odbiorców (TO_EMAIL: "a@a.com, b@b.com"),
+    * SendGrid (priorytet) lub SMTP (Gmail/M365) jako fallback.
 
 Wymagane paczki (requirements.txt):
 requests
@@ -26,11 +30,11 @@ openpyxl
 
 import os
 import re
-import time
 import json
+import time
 import argparse
-import datetime as dt
 import unicodedata
+import datetime as dt
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -39,51 +43,75 @@ import requests
 from bs4 import BeautifulSoup
 from dateutil import tz
 
-# --- Ścieżki / pliki ---
+# === Ścieżki / pliki ===
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-MASTER_CSV = os.path.join(DATA_DIR, "offers_master.csv")   # master trzymamy nadal jako CSV
+MASTER_CSV = os.path.join(DATA_DIR, "offers_master.csv")   # master trzymamy nadal w CSV
 
-# --- HTTP ---
+# === HTTP ===
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NatJobMonitor/1.2)",
+    "User-Agent": "Mozilla/5.0 (compatible; NatJobMonitor/1.3)",
     "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
 }
 SEARCH_URL = "https://www.pracuj.pl/praca/{kw}%3Bkw"
 REQUEST_DELAY = 1.2  # s
 
-
-# --------------- Pomocniki dat ---------------
+# =========================================================
+# Pomocniki – daty
+# =========================================================
 def _strip_accents(txt: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", txt) if unicodedata.category(c) != "Mn")
 
 def parse_pl_date(text: str) -> Optional[datetime]:
-    """Parsuje np. 'Opublikowana: 12 września 2025' / '12 wrzesnia 2025' → datetime."""
+    """
+    Parsuje polskie daty:
+    - 'Opublikowana: 12 września 2025'
+    - '12 wrzesnia 2025'
+    - '(do 11 paź)'  → zwraca 11.X bieżącego (heurystycznie) roku
+    Zwraca datetime albo None.
+    """
     if not text:
         return None
-    s = _strip_accents(str(text).lower())
-    s = re.sub(r"opublikowana:\s*", "", s)
-    m = re.search(r"(\d{1,2})\s+([a-z]+)\s+(\d{4})", s)
-    if not m:
-        try:
-            return pd.to_datetime(text, dayfirst=True, errors="raise")
-        except Exception:
-            return None
-    d, mon, y = int(m.group(1)), m.group(2), int(m.group(3))
-    months = {
-        "stycznia":1, "lutego":2, "marca":3, "kwietnia":4, "maja":5, "czerwca":6,
-        "lipca":7, "sierpnia":8, "wrzesnia":9, "pazdziernika":10, "listopada":11, "grudnia":12
+    s = _strip_accents(str(text).lower()).strip()
+    s = re.sub(r"^(opublikowana|opublikowano|dodano):\s*", "", s)
+
+    months_full = {
+        "stycznia":1,"lutego":2,"marca":3,"kwietnia":4,"maja":5,"czerwca":6,
+        "lipca":7,"sierpnia":8,"wrzesnia":9,"pazdziernika":10,"listopada":11,"grudnia":12
     }
-    mm = months.get(mon)
-    if not mm:
-        return None
+    months_abbr = {
+        "sty":1,"lut":2,"mar":3,"kwi":4,"maj":5,"cze":6,"lip":7,"sie":8,"wrz":9,"paz":10,"lis":11,"gru":12
+    }
+
+    # 1) pełny zapis: 12 wrzesnia 2025
+    m = re.search(r"(\d{1,2})\s+([a-ząćęłńóśźż]+)\s+(\d{4})", s)
+    if m:
+        d = int(m.group(1)); mon = _strip_accents(m.group(2)); y = int(m.group(3))
+        mm = months_full.get(mon) or months_abbr.get(mon[:3])
+        if mm:
+            try: return datetime(y, mm, d)
+            except: return None
+
+    # 2) skrót „do 11 paz”
+    m2 = re.search(r"(\d{1,2})\s+([a-z]{3})\b", s)
+    if m2:
+        d = int(m2.group(1)); mon3 = _strip_accents(m2.group(2)[:3])
+        mm = months_abbr.get(mon3)
+        if mm:
+            today = datetime.now()
+            y = today.year
+            try: return datetime(y, mm, d)
+            except: return None
+
+    # 3) fallback: pandas
     try:
-        return datetime(y, mm, d)
+        return pd.to_datetime(text, dayfirst=True, errors="raise").to_pydatetime()
     except Exception:
         return None
 
-
-# --------------- Scraping ---------------
+# =========================================================
+# Scraping – listing i podstrony ogłoszeń
+# =========================================================
 def sanitize_keyword(kw: str) -> str:
     from urllib.parse import quote
     return quote(kw, safe="")
@@ -108,21 +136,20 @@ def parse_list_page(html: str) -> List[Dict]:
         m = re.search(r"oferta.*?(\d{7,})", href)
         job_id = m.group(1) if m else None
 
-        # Minimalny kontekst; employer_name i tak dobierzemy z podstrony
         offers.append({
             "job_id": job_id,
             "title": title,
             "url": ("https://www.pracuj.pl" + href) if href.startswith("/") else href,
-            "company": None,          # fallback z listingu, ale i tak wzbogacimy
+            "company": None,      # fallback – i tak pobierzemy employer_name z podstrony
             "location": None,
         })
 
     # deduplikacja po job_id/url
-    unique = {}
+    uniq = {}
     for o in offers:
         k = o.get("job_id") or o["url"]
-        unique[k] = o
-    return list(unique.values())
+        uniq[k] = o
+    return list(uniq.values())
 
 def iterate_pages_for_keyword(keyword: str, max_pages: int = 50) -> List[Dict]:
     out = []
@@ -139,13 +166,13 @@ def iterate_pages_for_keyword(keyword: str, max_pages: int = 50) -> List[Dict]:
         if not batch:
             break
 
-        # filtr – tytuł musi zawierać frazę
+        # filtr: tytuł zawiera frazę
         pat = re.compile(keyword, re.IGNORECASE)
         batch = [b for b in batch if pat.search(b.get("title") or "")]
 
-        # przerwij, jeśli nic nowego
-        new_keys = { (b.get("job_id") or b["url"]) for b in batch }
-        old_keys = { (b.get("job_id") or b["url"]) for b in out }
+        # przerwij jeśli nic nowego
+        new_keys = {(b.get("job_id") or b["url"]) for b in batch}
+        old_keys = {(b.get("job_id") or b["url"]) for b in out}
         if not (new_keys - old_keys) and page > 1:
             break
 
@@ -155,25 +182,74 @@ def iterate_pages_for_keyword(keyword: str, max_pages: int = 50) -> List[Dict]:
     return out
 
 def enrich_offer_details(offer: Dict) -> Dict:
-    """Wzbogaca o employer_name, published, industry (jeśli dostępne)."""
+    """
+    Wzbogaca:
+    - employer_name: JSON-LD (hiringOrganization.name) lub [data-test="text-employerName"]
+    - published_iso/published: JSON-LD (datePosted)
+    - valid_through: JSON-LD (validThrough) lub z bloku 'do 11 paź' (opcjonalnie)
+    - industry: heurystycznie
+    """
     html = fetch_page(offer["url"])
     if not html:
         return offer
     soup = BeautifulSoup(html, "lxml")
 
-    # employer_name z <h2 data-test="text-employerName">
     employer = None
-    el = soup.select_one('[data-test="text-employerName"]')
-    if el:
-        employer = el.get_text(strip=True)
+    date_posted_iso = None
+    valid_through_iso = None
 
-    # data publikacji (heurystyka)
-    pub = None
-    el_pub = soup.find(string=re.compile(r"Opublikowana:\s*\d{1,2}\s"))
-    if el_pub:
-        pub = el_pub.strip()
+    # JSON-LD – najpewniejsze
+    for s in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(s.string or "")
+        except Exception:
+            continue
 
-    # branża (opcjonalnie)
+        candidates = []
+        if isinstance(data, dict):
+            if data.get("@type") == "JobPosting":
+                candidates = [data]
+            elif "@graph" in data and isinstance(data["@graph"], list):
+                candidates = [x for x in data["@graph"] if isinstance(x, dict) and x.get("@type") == "JobPosting"]
+        elif isinstance(data, list):
+            candidates = [x for x in data if isinstance(x, dict) and x.get("@type") == "JobPosting"]
+
+        for jp in candidates:
+            org = jp.get("hiringOrganization")
+            if isinstance(org, dict) and org.get("name"):
+                employer = employer or org.get("name")
+            if jp.get("datePosted"):
+                date_posted_iso = jp["datePosted"]
+            if jp.get("validThrough"):
+                valid_through_iso = jp["validThrough"]
+
+    # Fallback employer_name – nagłówek
+    if not employer:
+        el = soup.select_one('[data-test="text-employerName"]')
+        if el:
+            employer = el.get_text(strip=True)
+
+    # Fallback validThrough – blok „do DD mmm”
+    if not valid_through_iso:
+        dur = soup.select_one('[data-test="section-duration-info"]')
+        if dur:
+            txt = _strip_accents(" ".join(dur.stripped_strings).lower())
+            m = re.search(r"do\s+(\d{1,2})\s+([a-z]{3})", txt)
+            if m:
+                d = int(m.group(1))
+                mon3 = m.group(2)
+                mm_map = {"sty":1,"lut":2,"mar":3,"kwi":4,"maj":5,"cze":6,"lip":7,"sie":8,"wrz":9,"paz":10,"lis":11,"gru":12}
+                mm = mm_map.get(mon3)
+                if mm:
+                    today = datetime.now()
+                    y = today.year
+                    try:
+                        vt = datetime(y, mm, d)
+                        valid_through_iso = vt.strftime("%Y-%m-%d")
+                    except Exception:
+                        pass
+
+    # industry – jak było (heurystyka)
     industry = None
     for el2 in soup.select("li,div,span"):
         t = el2.get_text(" ", strip=True)
@@ -184,12 +260,25 @@ def enrich_offer_details(offer: Dict) -> Dict:
                 break
 
     offer["employer_name"] = employer
-    offer["published"] = pub
     offer["industry"] = industry
+
+    if date_posted_iso:
+        try:
+            dp = pd.to_datetime(date_posted_iso, utc=False, errors="coerce")
+            if pd.notnull(dp):
+                offer["published_iso"] = dp.strftime("%Y-%m-%d")  # do sortu i wyświetlania
+                offer["published"] = dp.strftime("%d %m %Y")      # opcjonalne „czytelne”
+        except Exception:
+            pass
+
+    if valid_through_iso:
+        offer["valid_through"] = valid_through_iso
+
     return offer
 
-
-# --------------- Master CSV ---------------
+# =========================================================
+# Master CSV
+# =========================================================
 def load_master() -> pd.DataFrame:
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -197,7 +286,7 @@ def load_master() -> pd.DataFrame:
         return pd.read_csv(MASTER_CSV, dtype=str)
     return pd.DataFrame(columns=[
         "job_id","title","company","employer_name","location",
-        "url","industry","published","first_seen","source"
+        "url","industry","published","published_iso","valid_through","first_seen","source"
     ])
 
 def save_master(df: pd.DataFrame):
@@ -209,54 +298,45 @@ def dedupe_concat(master: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
     master["__key"] = master["job_id"].fillna("") + "|" + master["url"].fillna("")
     new_df["__key"] = new_df["job_id"].fillna("") + "|" + new_df["url"].fillna("")
     combined = pd.concat([master, new_df], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["__key"])
-    combined = combined.drop(columns=["__key"])
+    combined = combined.drop_duplicates(subset=["__key"]).drop(columns=["__key"])
     return combined
 
-
-# --------------- HTML – pojedyncza tabela ---------------
+# =========================================================
+# HTML do maila – jedna tabela
+# =========================================================
 def build_html_summary(df: pd.DataFrame) -> str:
     """
     Jedna tabela: Nazwa firmy | Nazwa stanowiska | Link | Data dodania ogłoszenia.
-    Sort: najświeższe na górze (published → first_seen).
+    Sort: najświeższe na górze (published_iso → published parsowane → first_seen).
     """
     if df is None or df.empty:
         return "<p>(Brak nowych ofert)</p>"
 
     work = df.copy().fillna("")
-    for col in ["title","url","published","first_seen","employer_name","company"]:
+    for col in ["title","url","published","published_iso","first_seen","employer_name","company"]:
         if col not in work.columns:
             work[col] = ""
 
-    # wybór daty do wyświetlenia i klucza sortowania
-    pub_dt = work["published"].apply(lambda s: parse_pl_date(s) if isinstance(s, str) else None)
-    fs_dt  = pd.to_datetime(work["first_seen"], errors="coerce")
+    # Klucz sortowania
+    def _parse_any_date_row(r):
+        if r.get("published_iso"):
+            return pd.to_datetime(r.get("published_iso"), errors="coerce")
+        dt_pub = parse_pl_date(r.get("published"))
+        if dt_pub:
+            return pd.to_datetime(dt_pub)
+        return pd.to_datetime(r.get("first_seen"), errors="coerce")
 
-    sort_key, date_out = [], []
-    for i in range(len(work)):
-        dt_pub = pub_dt.iloc[i]
-        dt_fs  = fs_dt.iloc[i]
-        chosen = dt_pub if pd.notnull(dt_pub) else dt_fs
-        sort_key.append(chosen if pd.notnull(chosen) else pd.NaT)
-        date_out.append(
-            dt_pub.strftime("%Y-%m-%d") if pd.notnull(dt_pub)
-            else (pd.to_datetime(dt_fs).strftime("%Y-%m-%d") if pd.notnull(dt_fs) else "")
-        )
-    work["_sort"] = sort_key
-    work["_date_str"] = date_out
-
+    work["_sort"] = work.apply(_parse_any_date_row, axis=1)
     work = work.sort_values(by="_sort", ascending=False, na_position="last")
 
-    rows_html = []
+    rows = []
     for _, r in work.iterrows():
         company = (r.get("employer_name") or r.get("company") or "—")
-        title   = r["title"] or "—"
-        url     = r["url"]
-        date_s  = r["_date_str"] or ""
+        title   = r.get("title") or "—"
+        url     = r.get("url") or ""
+        date_s  = r.get("published_iso") or ""
         link_html = f'<a href="{url}" target="_blank" rel="noopener noreferrer">otwórz ogłoszenie</a>'
-        rows_html.append(
-            f"<tr><td>{company}</td><td>{title}</td><td>{link_html}</td><td>{date_s}</td></tr>"
-        )
+        rows.append(f"<tr><td>{company}</td><td>{title}</td><td>{link_html}</td><td>{date_s}</td></tr>")
 
     header = (
         "<p style='font-family:Arial,sans-serif'>"
@@ -272,19 +352,19 @@ def build_html_summary(df: pd.DataFrame) -> str:
         "<th style='text-align:left'>Link</th>"
         "<th style='text-align:left'>Data dodania ogłoszenia</th>"
         "</tr></thead>"
-        f"<tbody>{''.join(rows_html)}</tbody>"
+        f"<tbody>{''.join(rows)}</tbody>"
         "</table>"
     )
     return header + table
 
-
-# --------------- E-mail (tylko XLSX jako załącznik) ---------------
+# =========================================================
+# E-mail – tylko XLSX jako załącznik
+# =========================================================
 def email_new_offers_xlsx(new_offers_df: pd.DataFrame, xlsx_path: Optional[str]):
     """
-    Wysyła maila z HTML-ową tabelą + JEDYNYM załącznikiem XLSX (jeśli istnieje).
-    Wspiera wielu odbiorców (TO_EMAIL = 'a@a.com, b@b.com').
+    Wysyła maila z tabelą HTML + ZAŁĄCZNIK XLSX (bez CSV).
+    Obsługuje wielu odbiorców w TO_EMAIL (po przecinku).
     """
-    # odbiorcy
     to_value = os.environ.get("TO_EMAIL", "")
     to_emails = [e.strip() for e in to_value.split(",") if e.strip()]
     if not to_emails:
@@ -296,7 +376,7 @@ def email_new_offers_xlsx(new_offers_df: pd.DataFrame, xlsx_path: Optional[str])
     html_body = build_html_summary(new_offers_df)
     text_body = "Zobacz tabelę HTML w treści wiadomości. (Załącznik: XLSX)."
 
-    # --- SendGrid (priorytet) ---
+    # SendGrid
     api_key = os.environ.get("SENDGRID_API_KEY")
     if api_key:
         try:
@@ -308,18 +388,17 @@ def email_new_offers_xlsx(new_offers_df: pd.DataFrame, xlsx_path: Optional[str])
             message.add_content(Content("text/plain", text_body))
             message.add_content(Content("text/html", html_body))
 
-            attachments = []
             if xlsx_path and os.path.exists(xlsx_path):
                 with open(xlsx_path, "rb") as f:
                     encoded = base64.b64encode(f.read()).decode()
-                attachments.append(
-                    Attachment(FileContent(encoded),
-                               FileName(os.path.basename(xlsx_path)),
-                               FileType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-                               Disposition("attachment"))
-                )
-            if attachments:
-                message.attachment = attachments
+                message.attachment = [
+                    Attachment(
+                        FileContent(encoded),
+                        FileName(os.path.basename(xlsx_path)),
+                        FileType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                        Disposition("attachment"),
+                    )
+                ]
 
             sg = SendGridAPIClient(api_key)
             sg.send(message)
@@ -328,7 +407,7 @@ def email_new_offers_xlsx(new_offers_df: pd.DataFrame, xlsx_path: Optional[str])
         except Exception as e:
             print("SendGrid failed:", e)
 
-    # --- SMTP fallback (Gmail/M365) ---
+    # SMTP fallback
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_user = os.environ.get("SMTP_USER")
     smtp_pass = os.environ.get("SMTP_PASS")
@@ -370,8 +449,9 @@ def email_new_offers_xlsx(new_offers_df: pd.DataFrame, xlsx_path: Optional[str])
 
     print("No email credentials provided or email sending failed. Skipping email.")
 
-
-# --------------- Główny przebieg ---------------
+# =========================================================
+# Główny przebieg
+# =========================================================
 def run_scrape(full: bool) -> int:
     # frazy z pliku
     with open(os.path.join(os.path.dirname(__file__), "keywords.json"), "r", encoding="utf-8") as f:
@@ -382,16 +462,16 @@ def run_scrape(full: bool) -> int:
         print(f"[INFO] Szukam: {kw}")
         offers = iterate_pages_for_keyword(kw, max_pages=80 if full else 20)
         print(f"[INFO] Znaleziono {len(offers)} kart dla '{kw}' (przed enrich).")
-        for i, off in enumerate(offers):
+        for off in offers:
             off["source"] = "pracuj.pl"
             off["first_seen"] = dt.datetime.now(tz=tz.gettz("Europe/Warsaw")).strftime("%Y-%m-%d %H:%M:%S%z")
-            # teraz wzbogacamy KAŻDĄ ofertę, aby mieć employer_name
+            # wzbogacamy KAŻDĄ ofertę, aby mieć employer_name + datePosted
             try:
                 off = enrich_offer_details(off)
             except Exception:
                 pass
             all_rows.append(off)
-            time.sleep(0.35)  # delikatniejsze tempo: więcej wizyt na podstronach
+            time.sleep(0.35)  # delikatniejsze tempo, bo wchodzimy na podstrony
 
     df_new = pd.DataFrame(all_rows).drop_duplicates(subset=["job_id","url"])
     df_new = df_new[(df_new["title"].notna()) & (df_new["url"].notna())]
@@ -411,31 +491,36 @@ def run_scrape(full: bool) -> int:
 
     save_master(combined)
 
-    # --- SORTOWANIE nowości (najświeższe na górze) ---
-    def _parse_any_date(pub, fs):
-        dt_pub = parse_pl_date(pub) if isinstance(pub, str) else None
-        dt_fs  = pd.to_datetime(fs, errors="coerce")
-        return dt_pub if pd.notnull(dt_pub) else dt_fs
+    # Sort nowości (najświeższe na górze): preferuj published_iso → potem published parsowane → first_seen
+    def _parse_any_date_row(r):
+        if r.get("published_iso"):
+            return pd.to_datetime(r.get("published_iso"), errors="coerce")
+        dt_pub = parse_pl_date(r.get("published"))
+        if dt_pub:
+            return pd.to_datetime(dt_pub)
+        return pd.to_datetime(r.get("first_seen"), errors="coerce")
 
     if not new_only.empty:
         new_only = new_only.copy()
-        new_only["_sort"] = new_only.apply(lambda r: _parse_any_date(r.get("published"), r.get("first_seen")), axis=1)
+        new_only["_sort"] = new_only.apply(_parse_any_date_row, axis=1)
         new_only["_date_str"] = new_only.apply(
-            lambda r: (_parse_any_date(r.get("published"), r.get("first_seen")).strftime("%Y-%m-%d")
-                       if _parse_any_date(r.get("published"), r.get("first_seen")) is not None else ""),
+            lambda r: (r.get("published_iso") or
+                       (parse_pl_date(r.get("published")).strftime("%Y-%m-%d")
+                        if parse_pl_date(r.get("published")) else
+                        (pd.to_datetime(r.get("first_seen"), errors="coerce").strftime("%Y-%m-%d")
+                         if pd.notnull(pd.to_datetime(r.get("first_seen"), errors="coerce")) else ""))),
             axis=1
         )
         new_only = new_only.sort_values(by="_sort", ascending=False, na_position="last").drop(columns=["_sort"])
     else:
         new_only["_date_str"] = ""
 
-    # --- XLSX „dzisiejsze nowości” ---
+    # XLSX „dzisiejsze nowości”
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
     today = dt.datetime.now(tz=tz.gettz("Europe/Warsaw")).strftime("%Y%m%d")
     daily_xlsx = os.path.join(DATA_DIR, f"offers_NEW_{today}.xlsx")
 
-    # zbuduj tabelę z czytelnymi kolumnami
     export = new_only.copy()
     export["Nazwa firmy"] = export["employer_name"].fillna("").replace("", pd.NA)
     export["Nazwa firmy"] = export["Nazwa firmy"].fillna(export.get("company"))
@@ -449,7 +534,7 @@ def run_scrape(full: bool) -> int:
             xw, index=False, sheet_name="NEW"
         )
 
-    # --- e-mail (Tylko XLSX w załączniku, HTML tabela w treści) ---
+    # E-mail (HTML tabela + tylko XLSX jako załącznik)
     email_new_offers_xlsx(new_only, daily_xlsx)
 
     print(f"[DONE] Dodano: {added} (nowe dziś: {len(new_only)}) | Razem w master: {len(combined)}")
