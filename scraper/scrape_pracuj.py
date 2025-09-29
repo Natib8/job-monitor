@@ -321,8 +321,10 @@ def email_new_offers(new_offers_csv_path: str,
     - Załączniki: CSV (zawsze) + opcjonalnie XLSX.
     Nie rzuca wyjątku na niepowodzeniu – tylko loguje.
     """
-    to_email = os.environ.get("TO_EMAIL")
-    from_email = os.environ.get("FROM_EMAIL", to_email)
+   to_value = os.environ.get("TO_EMAIL", "")
+   to_emails = [e.strip() for e in to_value.split(",") if e.strip()]
+   from_email = os.environ.get("FROM_EMAIL", to_emails[0] if to_emails else None)
+
     subject = "NOWE oferty (Pracuj.pl) – Chief Accountant / Główna/y Księgowa/y"
 
     html_body = build_html_summary(new_offers_df)
@@ -345,7 +347,7 @@ def email_new_offers(new_offers_csv_path: str,
             from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition, Content
             import base64
 
-            message = Mail(from_email=from_email, to_emails=to_email, subject=subject)
+            message = Mail(from_email=from_email, to_emails=to_emails, subject=subject)
             message.add_content(Content("text/plain", text_body))
             message.add_content(Content("text/html", html_body))
 
@@ -391,7 +393,7 @@ def email_new_offers(new_offers_csv_path: str,
 
             msg = MIMEMultipart("mixed")
             msg["From"] = from_email
-            msg["To"] = to_email
+            msg["To"] = ", ".join(to_emails)
             msg["Subject"] = subject
 
             alt = MIMEMultipart("alternative")
@@ -422,7 +424,7 @@ def email_new_offers(new_offers_csv_path: str,
             with smtplib.SMTP(smtp_host, smtp_port) as server:
                 server.starttls()
                 server.login(smtp_user, smtp_pass)
-                server.sendmail(from_email, [to_email], msg.as_string())
+                server.sendmail(from_email, to_emails, msg.as_string())
             print("Email sent via SMTP.")
             return
         except Exception as e:
