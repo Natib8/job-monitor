@@ -1,0 +1,7 @@
+requests
+beautifulsoup4
+lxml
+pandas
+python-dateutil
+sendgrid
+html5lib
