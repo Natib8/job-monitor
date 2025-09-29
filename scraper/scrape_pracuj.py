@@ -197,41 +197,118 @@ def dedupe_concat(master: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
     combined = combined.drop(columns=["__key"])
     return combined
 
+import unicodedata
+from datetime import datetime
+
+def _strip_accents(txt: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", txt) if unicodedata.category(c) != "Mn")
+
+def parse_pl_date(text: str) -> Optional[datetime]:
+    """
+    Próbuje sparsować polską datę typu:
+    'Opublikowana: 12 września 2025' / '12 wrzesnia 2025'
+    Zwraca datetime (00:00) albo None.
+    """
+    if not text:
+        return None
+    s = _strip_accents(text.lower())
+    # usuń prefiks 'opublikowana:'
+    s = re.sub(r"opublikowana:\s*", "", s)
+    m = re.search(r"(\d{1,2})\s+([a-z]+)\s+(\d{4})", s)
+    if not m:
+        # fallback: spróbuj standardowych formatów
+        try:
+            return pd.to_datetime(text, dayfirst=True, errors="raise")
+        except Exception:
+            return None
+    d, mon, y = int(m.group(1)), m.group(2), int(m.group(3))
+    months = {
+        "stycznia":1, "lutego":2, "marca":3, "kwietnia":4, "maja":5, "czerwca":6,
+        "lipca":7, "sierpnia":8, "wrzesnia":9, "pazdziernika":10, "listopada":11, "grudnia":12
+    }
+    mm = months.get(mon)
+    if not mm:
+        return None
+    try:
+        return datetime(y, mm, d)
+    except Exception:
+        return None
 
 # --------------- HTML tabela do e-maila ---------------
 def build_html_summary(df: pd.DataFrame) -> str:
-    """HTML z tabelami pogrupowanymi po 'title'. Kolumny: Firma | Link."""
+    """
+    Jedna tabela: Nazwa firmy | Nazwa stanowiska | Link | Data dodania ogłoszenia.
+    Sortowanie: najświeższe na górze (po 'published' jeśli da się odczytać, inaczej po 'first_seen').
+    """
     if df is None or df.empty:
         return "<p>(Brak nowych ofert)</p>"
 
     work = df.copy()
-    for col in ["title", "company", "url"]:
+    for col in ["title", "company", "url", "published", "first_seen"]:
         if col not in work.columns:
             work[col] = ""
     work = work.fillna("")
 
-    blocks = []
-    for title, g in work.groupby("title", sort=True):
-        rows = []
-        for _, r in g.iterrows():
-            company = r["company"] or "—"
-            url = r["url"]
-            link_html = f'<a href="{url}" target="_blank" rel="noopener noreferrer">otwórz ogłoszenie</a>'
-            rows.append(f"<tr><td>{company}</td><td>{link_html}</td></tr>")
-        table = (
-            f"<h3 style='margin:16px 0 8px;font-family:Arial,sans-serif;font-size:16px'>{title}</h3>"
-            "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px'>"
-            "<thead><tr><th style='text-align:left'>Firma</th><th style='text-align:left'>Link</th></tr></thead>"
-            f"<tbody>{''.join(rows)}</tbody></table>"
+    # Policz kolumny pomocnicze: data publikacji (parsowana) i fallback do first_seen
+    pub_dt = work["published"].apply(lambda s: parse_pl_date(s) if isinstance(s, str) else None)
+    fs_dt = pd.to_datetime(work["first_seen"], errors="coerce")
+
+    # sort_key: preferuj publikację, jeśli znamy; w przeciwnym razie first_seen
+    sort_key = []
+    date_out = []
+    for i in range(len(work)):
+        dt_pub = pub_dt.iloc[i]
+        dt_fs  = fs_dt.iloc[i]
+        chosen = dt_pub if pd.notnull(dt_pub) else dt_fs
+        sort_key.append(chosen if pd.notnull(chosen) else pd.NaT)
+        # Data do wyświetlenia – YYYY-MM-DD
+        if pd.notnull(dt_pub):
+            date_out.append(dt_pub.strftime("%Y-%m-%d"))
+        elif pd.notnull(dt_fs):
+            date_out.append(pd.to_datetime(dt_fs).strftime("%Y-%m-%d"))
+        else:
+            date_out.append("")
+    work["_sort"] = sort_key
+    work["_date_str"] = date_out
+
+    # Sort malejąco (najświeższe na górze); NaT na końcu
+    work = work.sort_values(by="_sort", ascending=False, na_position="last")
+
+    # Budowa HTML
+    rows_html = []
+    for _, r in work.iterrows():
+        company = r["company"] or "—"
+        title   = r["title"] or "—"
+        url     = r["url"]
+        date_s  = r["_date_str"] or ""
+        link_html = f'<a href="{url}" target="_blank" rel="noopener noreferrer">otwórz ogłoszenie</a>'
+        rows_html.append(
+            f"<tr>"
+            f"<td>{company}</td>"
+            f"<td>{title}</td>"
+            f"<td>{link_html}</td>"
+            f"<td>{date_s}</td>"
+            f"</tr>"
         )
-        blocks.append(table)
 
     header = (
         "<p style='font-family:Arial,sans-serif'>"
-        "Poniżej <strong>nowe oferty</strong> (Pracuj.pl), pogrupowane według nazwy stanowiska:"
+        "Poniżej <strong>nowe oferty</strong> (Pracuj.pl):"
         "</p>"
     )
-    return header + "".join(blocks)
+    table = (
+        "<table border='1' cellpadding='6' cellspacing='0' "
+        "style='border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px'>"
+        "<thead><tr>"
+        "<th style='text-align:left'>Nazwa firmy</th>"
+        "<th style='text-align:left'>Nazwa stanowiska</th>"
+        "<th style='text-align:left'>Link</th>"
+        "<th style='text-align:left'>Data dodania ogłoszenia</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody>"
+        "</table>"
+    )
+    return header + table
 
 
 # --------------- E-mail (SendGrid + SMTP) ---------------
@@ -398,6 +475,22 @@ def run_scrape(full: bool) -> int:
 
     save_master(combined)
 
+    # --- SORTOWANIE nowości (najświeższe na górze) ---
+    def _parse_any_date(pub, fs):
+        dt_pub = parse_pl_date(pub) if isinstance(pub, str) else None
+        dt_fs  = pd.to_datetime(fs, errors="coerce")
+        return dt_pub if pd.notnull(dt_pub) else dt_fs
+
+    if not new_only.empty:
+        new_only = new_only.copy()
+        new_only["_sort"] = new_only.apply(
+            lambda r: _parse_any_date(r.get("published"), r.get("first_seen")),
+            axis=1
+        )
+        new_only = new_only.sort_values(
+            by="_sort", ascending=False, na_position="last"
+        ).drop(columns=["_sort"])
+   
     # pliki dnia
     today = dt.datetime.now(tz=tz.gettz("Europe/Warsaw")).strftime("%Y%m%d")
     daily_csv = os.path.join(DATA_DIR, f"offers_NEW_{today}.csv")
