@@ -5,3 +5,4 @@ pandas
 python-dateutil
 sendgrid
 html5lib
+openpyxl
